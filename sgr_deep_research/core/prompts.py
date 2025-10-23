@@ -47,3 +47,8 @@ class PromptLoader:
     def get_clarification_template(cls, clarifications: str) -> str:
         template = cls._load_prompt_file("clarification_response.txt")
         return template.format(clarifications=clarifications, current_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    @classmethod
+    def get_mem_agent_template(cls) -> str:
+        template = cls._load_prompt_file("mem_agent_prompt.txt")
+        return template

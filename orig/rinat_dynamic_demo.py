@@ -1,10 +1,18 @@
 """Dynamic tool version of Rinat's original SGR demo."""
 from __future__ import annotations
 
+import asyncio
 import json
 import operator
+import os
 from functools import reduce
+from pathlib import Path
 from typing import Annotated, ClassVar, Iterable, List, Literal, Type, TypeVar
+
+import yaml
+from fastmcp import Client
+from fastmcp.mcp_config import MCPConfig
+from jambo import SchemaConverter
 
 from annotated_types import Le, MaxLen, MinLen
 from openai import OpenAI
@@ -133,6 +141,102 @@ class NextStepToolsBuilder:
 
 
 # ---------------------------------------------------------------------------
+# MCP support helpers
+# ---------------------------------------------------------------------------
+
+
+MCP_CONFIG_PATH = Path(__file__).with_suffix(".mcp.yaml")
+MCP_CONTEXT_LIMIT = 15_000
+
+
+def _to_camel_case(name: str) -> str:
+    return name.replace("_", " ").title().replace(" ", "")
+
+
+def _expand_env_vars(value):
+    if isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_vars(v) for v in value]
+    if isinstance(value, str):
+        return os.path.expandvars(os.path.expanduser(value))
+    return value
+
+
+def load_mcp_config(path: Path = MCP_CONFIG_PATH) -> MCPConfig:
+    if not path.exists():
+        return MCPConfig()
+    data = yaml.safe_load(path.read_text()) or {}
+    config_dict = data.get("mcp", data)
+    config_dict = _expand_env_vars(config_dict)
+    try:
+        return MCPConfig.model_validate(config_dict)
+    except Exception:
+        return MCPConfig()
+
+
+class MCPBaseTool(BaseTool):
+    """Base tool that proxies execution to an MCP server."""
+
+    _config_dict: ClassVar[dict | None] = None
+    _context_limit: ClassVar[int] = MCP_CONTEXT_LIMIT
+
+    def __call__(self, _context: dict) -> str:
+        if not self._config_dict:
+            return "MCP is not configured"
+        payload = self.model_dump()
+        payload.pop("tool", None)
+        return asyncio.run(self._execute(payload))
+
+    @classmethod
+    async def _execute(cls, payload: dict) -> str:
+        client = Client(MCPConfig.model_validate(cls._config_dict))
+        async with client:
+            result = await client.call_tool(cls.tool_name, payload)
+        dumped = (
+            result.model_dump()
+            if hasattr(result, "model_dump")
+            else {"content": getattr(result, "content", str(result))}
+        )
+        return json.dumps(dumped, ensure_ascii=False)[: cls._context_limit]
+
+
+def build_mcp_tools(config: MCPConfig) -> list[Type[BaseTool]]:
+    if not config.mcpServers:
+        return []
+
+    config_dict = config.model_dump(exclude_none=True)
+
+    async def _load() -> list[Type[BaseTool]]:
+        tools: list[Type[BaseTool]] = []
+        client = Client(config)
+        async with client:
+            definitions = await client.list_tools()
+            for definition in definitions:
+                if not getattr(definition, "name", None) or not getattr(definition, "inputSchema", None):
+                    continue
+                schema = dict(definition.inputSchema)
+                schema.setdefault("title", _to_camel_case(definition.name))
+                try:
+                    pd_model = SchemaConverter.build(schema)
+                except Exception:
+                    continue
+                ToolCls: Type[BaseTool] = create_model(
+                    f"MCP{_to_camel_case(definition.name)}",
+                    __base__=(pd_model, MCPBaseTool),
+                    __doc__=definition.description or "",
+                    tool=(Literal[definition.name], definition.name),
+                )
+                ToolCls.tool_name = definition.name
+                ToolCls.description = definition.description or ""
+                ToolCls._config_dict = config_dict
+                tools.append(ToolCls)
+        return tools
+
+    return asyncio.run(_load())
+
+
+# ---------------------------------------------------------------------------
 # Tool implementations (identical behaviour to the original demo)
 # ---------------------------------------------------------------------------
 
@@ -249,6 +353,10 @@ class ReportTaskCompletion(CRMTool):
     def __call__(self, context: dict) -> str:
         report = {"code": self.code, "completed_steps": self.completed_steps_laconic}
         return self._json(report)
+
+
+MCP_CONFIG = load_mcp_config()
+build_mcp_tools(MCP_CONFIG)
 
 
 TOOLKIT: list[Type[BaseTool]] = list(ToolRegistry.all())

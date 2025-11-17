@@ -1,0 +1,9 @@
+# Example MCP configuration for the dynamic Rinat demo.
+# Values support standard $VAR or ${VAR} environment-variable substitution.
+mcp:
+  mcpServers:
+    confluence:
+      url: "${CONFLUENCE_MCP_URL}"
+      headers:
+        Authorization: "Bearer ${CONFLUENCE_MCP_TOKEN}"
+        X-Atlassian-Tenant: "${CONFLUENCE_CLOUD_ID}"
